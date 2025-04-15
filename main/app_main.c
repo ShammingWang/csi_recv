@@ -49,7 +49,8 @@
 
 #include "mqtt_client.h"
 
-
+#define WIFI_SSID "HyperOS2"
+#define WIFI_PASS "1685087768"
 
 // [1] YOUR CODE HERE
 #define CSI_BUFFER_LENGTH 800
@@ -239,8 +240,8 @@ static void wifi_init()
     // You need to modify the ssid and password to match your Wi-Fi network.
     wifi_config_t wifi_config = {
         .sta = {
-            .ssid = "HyperOS2",         
-            .password = "1685087768",
+            .ssid = WIFI_SSID,         
+            .password = WIFI_PASS,
             .threshold.authmode = WIFI_AUTH_WPA2_PSK,
             // UPDATES: only use this scan method when you want to connect your mobile phone's hotpot
             .scan_method = DEFAULT_SCAN_METHOD,
