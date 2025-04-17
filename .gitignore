@@ -5,3 +5,4 @@ test*
 evaluation_motion/
 evaluation_static/
 __pycache__/
+logs/
