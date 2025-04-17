@@ -8,8 +8,9 @@ into a local SQLite database.  —  订阅 /esp32/#，解析 CSI JSON 负载，
 
 import json
 import sqlite3
-from datetime import datetime, timezone, timedelta   # timestamp in UTC
+from datetime import datetime, timedelta   # timestamp in UTC
 import paho.mqtt.client as mqtt
+
 
 # ---------- 1. SQLite initialisation  数据库初始化 ----------
 DB_PATH = "csi_data.db"
@@ -93,10 +94,14 @@ def on_message(_client, _userdata, msg):
         print(f"[INFO] {now_iso} | Saved {len(rows)} frame(s) from topic {msg.topic}")
 
 # ---------- 3. MQTT client setup  启动 MQTT ----------
-client = mqtt.Client()
-client.on_connect = on_connect
-client.on_message = on_message
-client.connect("192.168.137.60", 1883)
-print("[MAIN] Waiting for packets …")
-client.loop_forever()
+
+if __name__ == "__main__":
+
+    client = mqtt.Client()
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.connect("192.168.137.60", 1883)
+    print("[MAIN] Waiting for packets …")
+
+    client.loop_forever()
 
