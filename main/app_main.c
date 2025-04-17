@@ -47,14 +47,19 @@
 #include "esp_now.h"
 
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_timer.h"
 #include "mqtt_client.h"
+#include <inttypes.h>  // 为了 PRIu32
 
-#define WIFI_SSID "HyperOS2"
-#define WIFI_PASS "1685087768"
+
+#define WIFI_SSID "ps5"
+#define WIFI_PASS "qwqqwqqwq"
 
 // [1] YOUR CODE HERE
-#define CSI_BUFFER_LENGTH 800
-#define CSI_FIFO_LENGTH 100
+#define CSI_BUFFER_LENGTH 8000
+#define CSI_FIFO_LENGTH 1000
 static int16_t CSI_Q[CSI_BUFFER_LENGTH];
 static int CSI_Q_INDEX = 0; // CSI Buffer Index
 // Enable/Disable CSI Buffering. 1: Enable, using buffer, 0: Disable, using serial output
@@ -73,40 +78,87 @@ bool motion_detection() {
 
 int breathing_rate_estimation() {
     // TODO: Implement breathing rate estimation using CSI data in CSI_Q
-    return 18; // Placeholder
+    static int random_bpm = 0;
+    return ++random_bpm;
 }
 
 
 static esp_mqtt_client_handle_t mqtt_client = NULL;
 static bool mqtt_connected = false;
 
+
+static void wifi_csi_init();
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     esp_mqtt_event_handle_t event = event_data;
-    esp_mqtt_client_handle_t client = event->client;
+    // esp_mqtt_client_handle_t client = event->client;
     const char *TAG = "mqtt";
 
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
             mqtt_connected = true;
+            // ✅ MQTT连接成功后再初始化CSI采集
+            wifi_csi_init();
+            ESP_LOGI(TAG, "✅ CSI capturing started after MQTT connected");
             break;
+    
         case MQTT_EVENT_DISCONNECTED:
-            ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+            ESP_LOGE(TAG, "MQTT_EVENT_DISCONNECTED");
+            mqtt_connected = false;
             break;
+    
         case MQTT_EVENT_ERROR:
             ESP_LOGE(TAG, "MQTT_EVENT_ERROR");
+            mqtt_connected = false;
             break;
+    
+        case MQTT_EVENT_PUBLISHED:
+            ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED: msg_id=%d", event->msg_id);
+            break;
+    
         default:
-            ESP_LOGI(TAG, "Other event id:%d", event->event_id);
+            ESP_LOGW(TAG, "Other event id: %d", event->event_id);
             break;
     }
 }
 
 void mqtt_app_start(void)
 {
+    if (mqtt_client != NULL) {
+        ESP_LOGW("mqtt", "MQTT client already started.");
+        return;
+    }
+
     const esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = "mqtt://192.168.77.93",  // 你的 MQTT Broker 地址
+        .broker.address.uri = "mqtt://192.168.137.60",  // ✅ IP写法OK，建议静态分配IP避免DHCP漂移
+    
+        .session = {
+            .keepalive = 120,                            // ✅ 保持连接更频繁地 PING，防止 Broker 断你
+            .protocol_ver = MQTT_PROTOCOL_V_3_1_1,
+            .disable_clean_session = false,             // 可选项，如果需要保留订阅等状态改为 true
+            .disable_keepalive = false,                 // 显式确保启用 keepalive
+        },
+    
+        .buffer = {
+            .size = 1024 * 16,                               // ✅ 太大会浪费 RAM，4096 一般够用
+            .out_size = 1024 * 16,
+        },
+    
+        .task = {
+            .priority = 10,                             // ✅ MQTT 任务设高优先级避免被抢占
+            .stack_size = 10240,                        // ✅ 加大堆栈防止 publish 阻塞崩溃
+        },
+    
+        .network = {
+            .timeout_ms = 1000,                        // ✅ 写入超时降低，避免 MQTT 写阻塞
+            .reconnect_timeout_ms = 1000,               // ✅ 更快触发重连
+            .disable_auto_reconnect = false,            // ✅ 自动重连开启
+        },
+    
+        .outbox = {
+            .limit = 128 * 1024,                         // ✅ 64KB 太大，建议降到 32KB 防止堆积
+        },
     };
 
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
@@ -115,15 +167,113 @@ void mqtt_app_start(void)
         return;
     }
 
-    // 注册事件回调（新版本方式）
     esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
-
     esp_mqtt_client_start(mqtt_client);
     ESP_LOGI("mqtt", "MQTT client started.");
 }
 
-void mqtt_send()
+// static char msg[64];
+
+#define MQTT_SEND_TIME 5
+
+static int64_t last_sent_time = 0;
+static int64_t send_interval = 1000000 / MQTT_SEND_TIME; // 1 second
+
+
+#define CSI_FRAME_FIFO_LEN   120          // ≥ CSI_BATCH_SEND_LEN，留点余量防止覆盖
+#define CSI_BATCH_SEND_LEN   3          // 一次打包发送 100 帧
+#define CSI_BUF_MAX_LEN      256          // 不变
+#define CSI_JSON_BUF_SIZE    (32 * 1024)  // ★ 增大 JSON 缓冲区（32KB 足够 100 帧）
+
+typedef struct {
+    uint8_t  mac[6];
+    int8_t   rssi;
+    uint8_t  rate;
+    int8_t   noise_floor;
+    uint8_t  fft_gain;
+    uint8_t  agc_gain;
+    uint8_t  channel;
+    uint32_t timestamp;
+    uint16_t sig_len;
+    uint8_t  rx_state;
+    uint8_t  first_word_invalid;
+    uint16_t len;                        // CSI buf 长度
+    int8_t   buf[CSI_BUF_MAX_LEN];       // CSI 原始数据
+    bool     valid;              // ★ 新增：该槽是否写入过数据
+} csi_frame_t;
+
+static csi_frame_t CSI_FRAMES[CSI_FRAME_FIFO_LEN];
+static volatile uint16_t g_frame_wr_idx = 0;   // 指向下一帧写入位置
+static volatile uint32_t g_total_frames = 0;   // 记录总帧数，便于判断是否 >=100
+
+
+
+void mqtt_send_csi_data(void)
 {
+    if (g_total_frames < CSI_BATCH_SEND_LEN) {
+        ESP_LOGW("mqtt", "Not enough CSI frames. Have %" PRIu32 " / %d",
+                 g_total_frames, CSI_BATCH_SEND_LEN);
+        return;
+    }
+
+    static char payload[CSI_JSON_BUF_SIZE];
+    size_t pos = 0;
+    pos += snprintf(payload + pos, sizeof(payload) - pos, "{\"frames\":[");
+
+    /* 取“最新的 N 帧”起始索引 */
+    int16_t start = (int16_t)g_frame_wr_idx - (int16_t)CSI_BATCH_SEND_LEN;
+    if (start < 0) start += CSI_FRAME_FIFO_LEN;
+
+    for (int i = 0; i < CSI_BATCH_SEND_LEN; ++i) {
+        uint16_t idx = (start + i) % CSI_FRAME_FIFO_LEN;
+        const csi_frame_t *f = &CSI_FRAMES[idx];
+
+        /* 跳过无效或长度异常的帧，保证安全 */
+        if (!f->valid || f->len == 0 || f->len > CSI_BUF_MAX_LEN) {
+            ESP_LOGW("mqtt", "Skip invalid frame idx=%d (len=%d, valid=%d)",
+                     idx, f->len, f->valid);
+            continue;
+        }
+
+        pos += snprintf(payload + pos, sizeof(payload) - pos,
+            "{"
+            "\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\","
+            "\"rssi\":%d,\"rate\":%d,\"noise_floor\":%d,"
+            "\"fft_gain\":%d,\"agc_gain\":%d,\"channel\":%d,"
+            "\"timestamp\":%" PRIu32 ",\"sig_len\":%u,\"rx_state\":%u,"
+            "\"first_word_invalid\":%u,\"csi\":[",
+            f->mac[0], f->mac[1], f->mac[2], f->mac[3], f->mac[4], f->mac[5],
+            f->rssi, f->rate, f->noise_floor,
+            f->fft_gain, f->agc_gain, f->channel,
+            f->timestamp, f->sig_len, f->rx_state,
+            f->first_word_invalid
+        );
+
+        for (int j = 0; j < f->len && pos < sizeof(payload) - 8; ++j) {
+            pos += snprintf(payload + pos, sizeof(payload) - pos,
+                            "%d%s", f->buf[j], (j < f->len - 1 ? "," : ""));
+        }
+
+        pos += snprintf(payload + pos, sizeof(payload) - pos,
+                        "]}%s", (i < CSI_BATCH_SEND_LEN - 1 ? "," : ""));
+    }
+
+    pos += snprintf(payload + pos, sizeof(payload) - pos, "]}");
+
+    /* 发布 MQTT */
+    if (mqtt_connected) {
+        esp_mqtt_client_publish(mqtt_client, "/esp32/csi_batch", payload, pos, 1, 0); // QOS 1
+    }
+    ESP_LOGI("mqtt", "Sent %d CSI frames, JSON=%d B -------------------------------------------------------", CSI_BATCH_SEND_LEN, (int)pos);
+}
+
+
+void mqtt_send()
+{   
+    int64_t now = esp_timer_get_time(); // 微秒
+    if (now - last_sent_time < send_interval) return; // 1 秒间隔
+    last_sent_time = now;
+
     if (mqtt_client == NULL) {
         mqtt_app_start();
         ESP_LOGW("mqtt", "MQTT client is not initialized yet.");
@@ -136,12 +286,13 @@ void mqtt_send()
         return;
     }
 
-    int bpm = breathing_rate_estimation();
-    char msg[64];
-    snprintf(msg, sizeof(msg), "{\"breathing_bpm\": %d}", bpm);
+    mqtt_send_csi_data();
+    // int bpm = breathing_rate_estimation();
+    
+    // snprintf(msg, sizeof(msg), "{\"breathing_bpm\": %d}", bpm);
 
-    int msg_id = esp_mqtt_client_publish(mqtt_client, "/esp32/breathing", msg, 0, 1, 0);
-    ESP_LOGI("mqtt", "MQTT message sent: id=%d | payload=%s", msg_id, msg);
+    // int msg_id = esp_mqtt_client_publish(mqtt_client, "/esp32/breathing", msg, strlen(msg), 1, 0);
+    // ESP_LOGI("mqtt", "MQTT message sent: id=%d | payload=%s", msg_id, msg);
 }
 
 
@@ -149,7 +300,7 @@ void mqtt_send()
 // [2] END OF YOUR CODE
 
 
-#define CONFIG_LESS_INTERFERENCE_CHANNEL    11
+#define CONFIG_LESS_INTERFERENCE_CHANNEL    6
 #define CONFIG_WIFI_BAND_MODE               WIFI_BAND_MODE_2G_ONLY
 #define CONFIG_WIFI_2G_BANDWIDTHS           WIFI_BW_HT20
 #define CONFIG_WIFI_5G_BANDWIDTHS           WIFI_BW_HT20
@@ -281,6 +432,8 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             ESP_LOGI(TAG, "Connected to AP - SSID: %s, Channel: %d, RSSI: %d",
                     ap_info.ssid, ap_info.primary, ap_info.rssi);
         }
+        // 👍 在这里启动 MQTT 客户端
+        mqtt_app_start();
     }
 }
 
@@ -306,7 +459,7 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 {
     if (!info || !info->buf) return;
 
-    ESP_LOGI(TAG, "CSI callback triggered");
+    // ESP_LOGI(TAG, "CSI callback triggered");
 
     // Applying the CSI_Q_ENABLE flag to determine the output method
     // 1: Enable, using buffer, 0: Disable, using serial output
@@ -370,9 +523,31 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
         ets_printf("]\"\n");
     }
 
-    else{
+    else {
+
         ESP_LOGI(TAG, "================ CSI RECV via Buffer ================");
         csi_process(info->buf, info->len);
+
+        // 保存完整 CSI 帧到 CSI_FRAMES 环形缓冲
+        csi_frame_t *dst = &CSI_FRAMES[g_frame_wr_idx];
+        memcpy(dst->mac, info->mac, 6);
+        dst->rssi               = rx_ctrl->rssi;
+        dst->rate               = rx_ctrl->rate;
+        dst->noise_floor        = rx_ctrl->noise_floor;
+        dst->fft_gain           = phy_info->fft_gain;
+        dst->agc_gain           = phy_info->agc_gain;
+        dst->channel            = rx_ctrl->channel;
+        dst->timestamp          = rx_ctrl->timestamp;
+        dst->sig_len            = rx_ctrl->sig_len;
+        dst->rx_state           = rx_ctrl->rx_state;
+        dst->first_word_invalid = info->first_word_invalid;
+        dst->len                = (info->len > CSI_BUF_MAX_LEN) ? CSI_BUF_MAX_LEN : info->len;
+        dst->valid = true;                // ★ 标记已写入
+        memcpy(dst->buf, info->buf, dst->len);
+        
+        g_frame_wr_idx = (g_frame_wr_idx + 1) % CSI_FRAME_FIFO_LEN;
+        if (g_total_frames < CSI_FRAME_FIFO_LEN) g_total_frames++;
+
     }
 }
 
@@ -384,7 +559,7 @@ static void csi_process(const int8_t *csi_data, int length)
         memmove(CSI_Q, CSI_Q + CSI_FIFO_LENGTH, shift_size * sizeof(int16_t));
         CSI_Q_INDEX = shift_size;
     }    
-    ESP_LOGI(TAG, "CSI Buffer Status: %d samples stored", CSI_Q_INDEX);
+    // ESP_LOGI(TAG, "CSI Buffer Status: %d samples stored", CSI_Q_INDEX);
     // Append new CSI data to the buffer
     for (int i = 0; i < length && CSI_Q_INDEX < CSI_BUFFER_LENGTH; i++) {
         CSI_Q[CSI_Q_INDEX++] = (int16_t)csi_data[i];
@@ -393,13 +568,14 @@ static void csi_process(const int8_t *csi_data, int length)
     // [4] YOUR CODE HERE
 
     // 1. Fill the information of your group members
-    ESP_LOGI(TAG, "================ GROUP INFO ================");
-    const char *TEAM_MEMBER[] = {"a", "b", "c", "d"};
-    const char *TEAM_UID[] = {"1", "2", "3", "4"};
-    ESP_LOGI(TAG, "TEAM_MEMBER: %s, %s, %s, %s | TEAM_UID: %s, %s, %s, %s",
-                TEAM_MEMBER[0], TEAM_MEMBER[1], TEAM_MEMBER[2], TEAM_MEMBER[3],
-                TEAM_UID[0], TEAM_UID[1], TEAM_UID[2], TEAM_UID[3]);
-    ESP_LOGI(TAG, "================ END OF GROUP INFO ================");
+
+    // ESP_LOGI(TAG, "================ GROUP INFO ================");
+    // const char *TEAM_MEMBER[] = {"a", "b", "c", "d"};
+    // const char *TEAM_UID[] = {"1", "2", "3", "4"};
+    // ESP_LOGI(TAG, "TEAM_MEMBER: %s, %s, %s, %s | TEAM_UID: %s, %s, %s, %s",
+    //             TEAM_MEMBER[0], TEAM_MEMBER[1], TEAM_MEMBER[2], TEAM_MEMBER[3],
+    //             TEAM_UID[0], TEAM_UID[1], TEAM_UID[2], TEAM_UID[3]);
+    // ESP_LOGI(TAG, "================ END OF GROUP INFO ================");
 
     // 2. Call your algorithm functions here, e.g.: motion_detection(), breathing_rate_estimation(), and mqtt_send()
     // If you implement the algorithm on-board, you can return the results to the host, else send the CSI data.
@@ -481,6 +657,8 @@ void app_main()
      */
     // wifi_connected = 1;
     
+    
+
     if (wifi_connected) {
         esp_now_peer_info_t peer = {
             .channel   = CONFIG_LESS_INTERFERENCE_CHANNEL,
@@ -491,8 +669,14 @@ void app_main()
         
         wifi_esp_now_init(peer); // Initialize ESP-NOW Communication
         ESP_LOGI(TAG, "wifi_esp_now_init");
-        wifi_csi_init(); // Initialize CSI Collection
-        ESP_LOGI(TAG, "wifi_csi_init");
+
+        // mqtt_app_start(); // Initialize MQTT Client
+        // ESP_LOGW("mqtt", "start MQTT client ...");
+        // while (mqtt_client == NULL) {
+        //     ESP_LOGW("mqtt", "MQTT client is not initialized yet. ----------------------------------------------------------");
+        // }
+        // wifi_csi_init(); // Initialize CSI Collection
+        // ESP_LOGI(TAG, "wifi_csi_init");
 
     } else {
         ESP_LOGI(TAG, "WiFi connection failed");
