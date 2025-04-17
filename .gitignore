@@ -4,3 +4,4 @@ test*
 *.db
 evaluation_motion/
 evaluation_static/
+__pycache__/
