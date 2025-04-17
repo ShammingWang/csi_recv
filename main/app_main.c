@@ -174,14 +174,14 @@ void mqtt_app_start(void)
 
 // static char msg[64];
 
-#define MQTT_SEND_TIME 5
+#define MQTT_SEND_TIME 10
 
 static int64_t last_sent_time = 0;
 static int64_t send_interval = 1000000 / MQTT_SEND_TIME; // 1 second
 
 
 #define CSI_FRAME_FIFO_LEN   120          // ≥ CSI_BATCH_SEND_LEN，留点余量防止覆盖
-#define CSI_BATCH_SEND_LEN   3          // 一次打包发送 100 帧
+#define CSI_BATCH_SEND_LEN   2          // 一次打包发送 100 帧
 #define CSI_BUF_MAX_LEN      256          // 不变
 #define CSI_JSON_BUF_SIZE    (32 * 1024)  // ★ 增大 JSON 缓冲区（32KB 足够 100 帧）
 
