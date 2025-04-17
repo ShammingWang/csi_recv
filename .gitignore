@@ -2,3 +2,5 @@
 build/
 test*
 *.db
+evaluation_motion/
+evaluation_static/
