@@ -233,96 +233,101 @@ def process_breathing_rate_sliding_window(complex_signals, timestamps, window_le
         current_time += step
     return results, dict_cal_int, dict_cal_plot
 
-def process_breathing_rate_from_db(db_path="csi_data.db", window_length_sec=15, update_interval=1):
+
+def calculate_bpm_once(db_path="csi_data.db", window_length_sec=15):
     """
-    每隔 update_interval 秒，从数据库中提取最近 window_length_sec 内的数据，
-    计算 BPM 并通过 websocket 推送。
+    从数据库中提取最近 window_length_sec 秒的数据，返回当前时间、采样率、BPM。
     """
     dt_format = "%Y-%m-%d %H:%M:%S"
-    while True:
-        dt_ISO_format = "%Y-%m-%d %H:%M:%S"
+    now = datetime.now()
+    window_start = now - timedelta(seconds=window_length_sec)
+    window_start_str = window_start.strftime(dt_format)
 
-        now = datetime.now()
-        window_start = now - timedelta(seconds=window_length_sec)
-        window_start_str = window_start.strftime(dt_format)
-        
-        # 查询最近 window_length_sec 内的数据（按 received_at_utc 升序排列）
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        query = ("SELECT received_at_utc, csi_json FROM csi_frame "
-                "WHERE received_at_utc >= ? ORDER BY received_at_utc ASC")
-        cursor.execute(query, (window_start_str,))
-        rows = cursor.fetchall()
-        conn.close()
-        
-        csi_signals = []
-        timestamps = []
-        # 解析每一行数据
-        for row in rows:
-            ts = row[0]
-            csi_json_str = row[1]
-            try:
-                csi_list = json.loads(csi_json_str)
-            except Exception as e:
-                print("JSON decode error:", e)
-                continue
-            if len(csi_list) != 114:
-                continue
-            csi_signals.append(np.array(csi_list))
-            timestamps.append(ts)
-        
-        if not csi_signals:
-            print(f"{now.strftime(dt_format)}: No data in the most recent {window_length_sec}s window.")
-        else:
-            # 将原始信号转换为复数信号（调用 csi_to_complex_v2）
-            complex_signals = csi_to_complex_v2(csi_signals)
-            dt_list = []
-            for t in timestamps:
-                try:
-                    if "T" in t:
-                        # 例如："2025-04-17T07:07:44.173400+00:00" -> "2025-04-17 07:07:44"
-                        t_clean = t.split('.')[0].replace("T", " ")
-                        dt_elem = datetime.strptime(t_clean, "%Y-%m-%d %H:%M:%S")
-                    else:
-                        dt_elem = datetime.strptime(t, "%Y-%m-%d %H:%M:%S")
-                except Exception as e:
-                    print("Error parsing time", t, e)
-                    continue
-                dt_list.append(dt_elem)
-            # 计算采样率 fs：采样数除以时间间隔（秒）
-            duration = (dt_list[-1] - dt_list[0]).total_seconds()
-            if duration <= 0:
-                duration = 1.0
-            fs = len(dt_list) / duration
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    query = ("SELECT received_at_utc, csi_json FROM csi_frame "
+             "WHERE received_at_utc >= ? ORDER BY received_at_utc ASC")
+    cursor.execute(query, (window_start_str,))
+    rows = cursor.fetchall()
+    conn.close()
 
-            n_subcarriers = complex_signals[0].shape[0]
-            bpm_list = []
-            # 对每个子载波提取幅值序列，预处理后估计 BPM
-            for sub_idx in range(n_subcarriers):
-                subcarrier_series = np.array([np.abs(s[sub_idx]) for s in complex_signals])
-                if len(subcarrier_series) < 2:
-                    continue
-                proc = pre_process_signal(subcarrier_series, fs)
-                bpm = estimate_bpm_acf(proc, fs)
-                if 8 <= bpm <= 30:
-                    bpm_list.append(bpm)
-            if bpm_list:
-                median_bpm = np.median(bpm_list)
-                avg_bpm_int = round(median_bpm)
+    csi_signals = []
+    timestamps = []
+
+    for row in rows:
+        ts = row[0]
+        csi_json_str = row[1]
+        try:
+            csi_list = json.loads(csi_json_str)
+        except Exception as e:
+            print("JSON decode error:", e)
+            continue
+        if len(csi_list) != 114:
+            continue
+        csi_signals.append(np.array(csi_list))
+        timestamps.append(ts)
+
+    if not csi_signals:
+        return now, 0.0, 0
+
+    # 转复数
+    complex_signals = csi_to_complex_v2(csi_signals)
+    dt_list = []
+    for t in timestamps:
+        try:
+            if "T" in t:
+                t_clean = t.split('.')[0].replace("T", " ")
+                dt_elem = datetime.strptime(t_clean, "%Y-%m-%d %H:%M:%S")
             else:
-                median_bpm = 0.0
-                avg_bpm_int = 0
-            current_time_str = now.strftime(dt_format)
-            print(f"{current_time_str}: fs = {fs:.2f} Hz, BPM = {avg_bpm_int}")
-            # update_websocket(current_time_str, median_bpm, avg_bpm_int)
-        
+                dt_elem = datetime.strptime(t, "%Y-%m-%d %H:%M:%S")
+        except Exception as e:
+            print("Error parsing time", t, e)
+            continue
+        dt_list.append(dt_elem)
+
+    duration = (dt_list[-1] - dt_list[0]).total_seconds()
+    if duration <= 0:
+        duration = 1.0
+    fs = len(dt_list) / duration
+
+    n_subcarriers = complex_signals[0].shape[0]
+    bpm_list = []
+    for sub_idx in range(n_subcarriers):
+        subcarrier_series = np.array([np.abs(s[sub_idx]) for s in complex_signals])
+        if len(subcarrier_series) < 2:
+            continue
+        proc = pre_process_signal(subcarrier_series, fs)
+        bpm = estimate_bpm_acf(proc, fs)
+        if 8 <= bpm <= 30:
+            bpm_list.append(bpm)
+
+    if bpm_list:
+        median_bpm = np.median(bpm_list)
+        avg_bpm_int = round(median_bpm)
+    else:
+        median_bpm = 0.0
+        avg_bpm_int = 0
+
+    return now, fs, avg_bpm_int
+
+
+def process_breathing_rate_from_db(db_path="csi_data.db", window_length_sec=15, update_interval=1):
+    """
+    每隔 update_interval 秒循环调用一次 BPM 计算函数。
+    """
+    while True:
+        now, fs, bpm = calculate_bpm_once(db_path=db_path, window_length_sec=window_length_sec)
+        time_str = now.strftime("%Y-%m-%d %H:%M:%S")
+        if bpm == 0:
+            print(f"{time_str}: No valid CSI data in the last {window_length_sec}s.")
+        else:
+            print(f"{time_str}: fs = {fs:.2f} Hz, BPM = {bpm}")
         time.sleep(update_interval)
 
 
 if __name__ == "__main__":
-    # filepath = "/Users/mac/Documents/code/aiot/comp7310_2025_group_project/benchmark/breathing_rate/test/CSI20250227_201424.csv"
-    pass
-
+    filepath = "/Users/mac/Documents/code/aiot/comp7310_2025_group_project/benchmark/breathing_rate/test/CSI20250227_201424.csv"
+    
     # csi_signals, timestamps = parse_csi_file(filepath)
     # complex_signals = csi_to_complex(csi_signals)
     # _, dict_cal_int, dict_cal_plot = process_breathing_rate_sliding_window(complex_signals, timestamps, window_length_sec=20, step_sec=1)

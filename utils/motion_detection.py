@@ -2,7 +2,7 @@ import json
 import sqlite3
 import numpy as np
 import pandas as pd
-import os
+import os, pickle
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
@@ -52,6 +52,8 @@ def extract_features_from_dataframe_test(df):
         max_std = np.max(np.std(window, axis=0))
         features.append([mean_std, max_std])
     return features
+
+
 # 从 SQLite 数据库加载数据
 
 # def load_from_database(limit=500):
@@ -107,21 +109,22 @@ def load_dataset_from_folder(folder_path, label):
 # 使用模型预测数据库中数据
 def predict_from_database(clf):
     # df = load_from_database(limit=200)
-    df = load_from_database(seconds=5)
+    df = load_from_database(seconds=3)
     feats = extract_features_from_dataframe_test(df)
     if not feats:
         print("没有有效的 CSI 数据可用于预测")
-        return
+        return None
 
     preds = clf.predict(feats)
     majority_vote = int(np.round(np.mean(preds)))
-    print(f"\nPrediction：{'motion (true)' if majority_vote == 1 else 'static (false)'}")
+    # print(f"\nPrediction：{'motion (true)' if majority_vote == 1 else 'static (false)'}")
+    return True if majority_vote == 1 else False
     #print(f"[细节] 每帧预测：{preds.tolist()}")
 
 # 训练模型
 def train_model():
-    X_motion, y_motion = load_dataset_from_folder("evaluation_motion", label=1)
-    X_static, y_static = load_dataset_from_folder("evaluation_static", label=0)
+    X_motion, y_motion = load_dataset_from_folder("../evaluation_motion", label=1)
+    X_static, y_static = load_dataset_from_folder("../evaluation_static", label=0)
     X = X_motion + X_static
     y = y_motion + y_static
 
@@ -133,14 +136,18 @@ def train_model():
     clf = RandomForestClassifier(n_estimators=100, random_state=42)
     clf.fit(X_train, y_train)
 
-    acc = accuracy_score(y_test, clf.predict(X_test))
+    # acc = accuracy_score(y_test, clf.predict(X_test))
     return clf
 
 def motion_detection():
     # 训练模型
-    clf = train_model()
+    # clf = train_model()
+    with open("models/random_forest_csi_model.pkl", "rb") as f:
+        clf = pickle.load(f)
     if clf:
-        predict_from_database(clf)
+        return predict_from_database(clf)
+    else:
+        print("模型加载失败")
 
 import time
 
@@ -150,4 +157,4 @@ if __name__ == "__main__":
         while True:
             # 每 10 秒预测一次
             predict_from_database(clf)
-            time.sleep(5)
+            time.sleep(3)
